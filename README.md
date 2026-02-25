@@ -118,6 +118,20 @@ The conditioning pathway encodes spatial structure and injects features at multi
 
 ---
 
+## Example usage
+
+env -u LD_LIBRARY_PATH python conditional_ddpm_inpainting.py \
+  --train \
+  --clean-path cifar10_grayscale_32x32.npy \
+  --corrupted-path cifar10_grayscale_32x32_corrupted.npy \
+  --checkpoint-path checkpoints/ddpm_inpainting.pt \
+  --batch-size 128 \
+  --epochs 100 \
+  --lr 2e-4
+  
+---
+
 ## Summary
 
 This repository demonstrates how conditional diffusion models can solve reconstruction problems by learning the conditional score function and sampling from the resulting posterior distribution given corrupted observations.
+
