@@ -1,7 +1,4 @@
 # ddpm-inpainting
-conditional-ddpm-inpainting
-
-# Conditional DDPM Reconstruction from Corrupted Inputs
 
 Conditional diffusion for image reconstruction from corrupted or sparse observations using PyTorch.
 
