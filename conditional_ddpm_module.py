@@ -22,7 +22,13 @@ class Config:
     schedule: str = "cosine"
     dim: int = 48
     dim_mults: Tuple[int, ...] = (1, 2, 4)
-
+    batch_size: int = 128
+    epochs: int = 100
+    lr: float = 2e-4
+    weight_decay: float = 1e-4
+    ema_decay: float = 0.999
+    seed: int = 42
+    num_workers: int = 4
 
 # =========================================================
 # Normalization
@@ -35,7 +41,6 @@ def normalize_img(x: torch.Tensor) -> torch.Tensor:
 def denormalize_img(x: torch.Tensor) -> torch.Tensor:
     return torch.clamp((x + 1.0) / 2.0, 0.0, 1.0)
 
-
 # =========================================================
 # Schedules
 # =========================================================
@@ -47,6 +52,7 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.008) -> torch.Tensor:
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return betas.clamp(1e-5, 0.999).float()
+
 
 
 def linear_beta_schedule(timesteps: int, beta_start: float, beta_end: float) -> torch.Tensor:
@@ -70,19 +76,6 @@ class SinusoidalPosEmb(nn.Module):
         return torch.cat([emb.sin(), emb.cos()], dim=-1)
 
 
-class LayerNorm2d(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(1, dim, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(1, dim, 1, 1))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        var = torch.var(x, dim=1, unbiased=False, keepdim=True)
-        mean = torch.mean(x, dim=1, keepdim=True)
-        return (x - mean) / torch.sqrt(var + self.eps) * self.weight + self.bias
-
-
 class Residual(nn.Module):
     def __init__(self, fn: nn.Module):
         super().__init__()
@@ -90,6 +83,19 @@ class Residual(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fn(x) + x
+
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, dim, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        var = torch.var(x, dim=1, unbiased=False, keepdim=True)
+        mean = torch.mean(x, dim=1, keepdim=True)
+        return (x - mean) / torch.sqrt(var + self.eps) * self.weight + self.bias
 
 
 class PreNorm(nn.Module):
@@ -100,33 +106,6 @@ class PreNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fn(self.norm(x))
-
-
-class LinearAttention(nn.Module):
-    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
-        super().__init__()
-        self.heads = heads
-        hidden_dim = heads * dim_head
-        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
-        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), LayerNorm2d(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, _, h, w = x.shape
-        q, k, v = self.to_qkv(x).chunk(3, dim=1)
-
-        q = rearrange(q, "b (h d) x y -> b h d (x y)", h=self.heads)
-        k = rearrange(k, "b (h d) x y -> b h d (x y)", h=self.heads)
-        v = rearrange(v, "b (h d) x y -> b h d (x y)", h=self.heads)
-
-        q = q.softmax(dim=-2)
-        k = k.softmax(dim=-1)
-
-        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
-        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
-        out = rearrange(out, "b h d (x y) -> b (h d) x y", x=h, y=w)
-
-        return self.to_out(out)
-
 
 class Block(nn.Module):
     def __init__(self, dim: int, dim_out: int, groups: int = 8):
@@ -159,6 +138,30 @@ class ResnetBlock(nn.Module):
         return h + self.res_conv(x)
 
 
+class LinearAttention(nn.Module):
+    def __init__(self, dim: int, heads: int = 4, dim_head: int = 32):
+        super().__init__()
+        self.heads = heads
+        hidden_dim = heads * dim_head
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias=False)
+        self.to_out = nn.Sequential(nn.Conv2d(hidden_dim, dim, 1), LayerNorm2d(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, _, h, w = x.shape
+        q, k, v = self.to_qkv(x).chunk(3, dim=1)
+        q = rearrange(q, "b (h d) x y -> b h d (x y)", h=self.heads)
+        k = rearrange(k, "b (h d) x y -> b h d (x y)", h=self.heads)
+        v = rearrange(v, "b (h d) x y -> b h d (x y)", h=self.heads)
+
+        q = q.softmax(dim=-2)
+        k = k.softmax(dim=-1)
+
+        context = torch.einsum("b h d n, b h e n -> b h d e", k, v)
+        out = torch.einsum("b h d e, b h d n -> b h e n", context, q)
+        out = rearrange(out, "b h d (x y) -> b (h d) x y", x=h, y=w)
+        return self.to_out(out)
+
+
 class Downsample(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -177,6 +180,7 @@ class Upsample(nn.Module):
         return self.op(x)
 
 
+
 # =========================================================
 # Conditional UNet
 # =========================================================
@@ -191,7 +195,6 @@ class ConditionalUNet(nn.Module):
         groups: int = 8,
     ):
         super().__init__()
-
         dims = [dim, *[dim * m for m in dim_mults]]
         in_out = list(zip(dims[:-1], dims[1:]))
 
@@ -220,9 +223,9 @@ class ConditionalUNet(nn.Module):
             )
 
         mid_dim = dims[-1]
-        self.mid1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=time_dim, groups=groups)
+        self.mid_block1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=time_dim, groups=groups)
         self.mid_attn = Residual(PreNorm(mid_dim, LinearAttention(mid_dim)))
-        self.mid2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=time_dim, groups=groups)
+        self.mid_block2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim=time_dim, groups=groups)
 
         self.ups = nn.ModuleList()
         for i, (dim_in, dim_out) in enumerate(reversed(in_out)):
@@ -248,28 +251,27 @@ class ConditionalUNet(nn.Module):
         t_emb = self.time_mlp(t)
 
         skips = []
-        for b1, b2, attn, down in self.downs:
-            x = b1(x, t_emb)
-            x = b2(x, t_emb)
+        for block1, block2, attn, down in self.downs:
+            x = block1(x, t_emb)
+            x = block2(x, t_emb)
             x = attn(x)
             skips.append(x)
             x = down(x)
 
-        x = self.mid1(x, t_emb)
+        x = self.mid_block1(x, t_emb)
         x = self.mid_attn(x)
-        x = self.mid2(x, t_emb)
+        x = self.mid_block2(x, t_emb)
 
-        for b1, b2, attn, up in self.ups:
+        for block1, block2, attn, up in self.ups:
             x = torch.cat([x, skips.pop()], dim=1)
-            x = b1(x, t_emb)
-            x = b2(x, t_emb)
+            x = block1(x, t_emb)
+            x = block2(x, t_emb)
             x = attn(x)
             x = up(x)
 
         x = torch.cat([x, residual], dim=1)
         x = self.final_res(x, t_emb)
         return self.final_conv(x)
-
 
 # =========================================================
 # Diffusion
@@ -278,7 +280,6 @@ class ConditionalUNet(nn.Module):
 class Diffusion:
     def __init__(self, config: Config):
         self.config = config
-
         if config.schedule == "cosine":
             betas = cosine_beta_schedule(config.timesteps)
         else:
@@ -293,24 +294,41 @@ class Diffusion:
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None):
         if noise is None:
             noise = torch.randn_like(x0)
-
         a = self.sqrt_alpha_bars[t].view(-1, 1, 1, 1)
         b = self.sqrt_one_minus_alpha_bars[t].view(-1, 1, 1, 1)
+        xt = a * x0 + b * noise
+        return xt, noise
 
-        return a * x0 + b * noise, noise
+
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    with torch.no_grad():
+        msd = model.state_dict()
+        for k, v in ema_model.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(decay).add_(msd[k], alpha=1.0 - decay)
+            else:
+                v.copy_(msd[k])
 
 
-def ddpm_step(x_t, pred_noise, t, diffusion: Diffusion):
+def ddpm_step(
+    x_t: torch.Tensor,
+    pred_noise: torch.Tensor,
+    t: int,
+    diffusion: Diffusion,
+) -> torch.Tensor:
     beta_t = diffusion.betas[t]
     alpha_t = diffusion.alphas[t]
     alpha_bar_t = diffusion.alpha_bars[t]
 
+    # mean = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-alpha_bar_t) * pred_noise)
     mean = (1.0 / torch.sqrt(alpha_t)) * (
         x_t - (beta_t / torch.sqrt(1.0 - alpha_bar_t)) * pred_noise
     )
 
     if t > 0:
+        sigma = torch.sqrt(beta_t)
         noise = torch.randn_like(x_t)
-        return mean + torch.sqrt(beta_t) * noise
-
+        return mean + sigma * noise
     return mean
+
+

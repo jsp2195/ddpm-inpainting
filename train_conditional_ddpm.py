@@ -2,10 +2,11 @@ import argparse
 import copy
 import os
 import random
-from typing import Optional
+from typing import Optional, Dict
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
 from torch.cuda.amp import GradScaler, autocast
@@ -16,8 +17,6 @@ from conditional_ddpm_module import (
     ConditionalUNet,
     Diffusion,
     normalize_img,
-    denormalize_img,
-    ddpm_step,
 )
 
 
@@ -54,6 +53,8 @@ class InpaintingNpyDataset(Dataset):
         return corrupted_t, clean_t, mask_t
 
 
+
+
 # =========================================================
 # Utils
 # =========================================================
@@ -65,7 +66,13 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def create_loaders(clean_path, corrupted_path, batch_size, val_split, seed):
+def create_dataloaders(
+    clean_path: str,
+    corrupted_path: str,
+    batch_size: int,
+    val_split: float,
+    seed: int,
+):
 
     clean = np.load(clean_path)
     corrupted = np.load(corrupted_path)
@@ -83,9 +90,18 @@ def create_loaders(clean_path, corrupted_path, batch_size, val_split, seed):
     return train_loader, val_loader
 
 
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float):
+    with torch.no_grad():
+        msd = model.state_dict()
+        for k, v in ema_model.state_dict().items():
+            if v.dtype.is_floating_point:
+                v.mul_(decay).add_(msd[k], alpha=1 - decay)
+            else:
+                v.copy_(msd[k])
+
+
 def save_checkpoint(path, model, ema_model, optimizer, epoch, step):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
     torch.save(
         {
             "model": model.state_dict(),
@@ -98,24 +114,56 @@ def save_checkpoint(path, model, ema_model, optimizer, epoch, step):
     )
 
 
+def evaluate(model, diffusion, loader, device, use_amp):
+    model.eval()
+    losses = []
+
+    with torch.no_grad():
+        for corrupted, clean, mask in loader:
+
+            corrupted = corrupted.to(device)
+            clean = clean.to(device)
+            mask = mask.to(device)
+
+            cond = torch.cat([corrupted, mask], dim=1)
+
+            t = torch.randint(0, diffusion.config.timesteps, (clean.size(0),), device=device)
+            x_t, noise = diffusion.q_sample(clean, t)
+
+            with autocast(enabled=use_amp):
+                pred_noise = model(x_t, t, cond)
+                loss = F.mse_loss(pred_noise, noise)
+
+            losses.append(loss.item())
+
+    return float(np.mean(losses))
+
 # =========================================================
 # Train
 # =========================================================
+
 
 def train(args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    config = Config(device=device, timesteps=args.timesteps)
+    config = Config(
+        device=device,
+        timesteps=args.timesteps,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        seed=args.seed,
+    )
 
-    set_seed(args.seed)
+    set_seed(config.seed)
 
-    train_loader, val_loader = create_loaders(
+    train_loader, val_loader = create_dataloaders(
         args.clean_path,
         args.corrupted_path,
-        args.batch_size,
+        config.batch_size,
         args.val_split,
-        args.seed,
+        config.seed,
     )
 
     model = ConditionalUNet(
@@ -129,13 +177,17 @@ def train(args):
 
     diffusion = Diffusion(config)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=config.epochs
+    )
 
-    scaler = GradScaler(enabled=device.type == "cuda")
+    use_amp = device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
 
     global_step = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(config.epochs):
 
         model.train()
         losses = []
@@ -149,12 +201,11 @@ def train(args):
             cond = torch.cat([corrupted, mask], dim=1)
 
             t = torch.randint(0, config.timesteps, (clean.size(0),), device=device)
-
             x_t, noise = diffusion.q_sample(clean, t)
 
             optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=device.type == "cuda"):
+            with autocast(enabled=use_amp):
                 pred_noise = model(x_t, t, cond)
                 loss = F.mse_loss(pred_noise, noise)
 
@@ -162,15 +213,20 @@ def train(args):
             scaler.step(optimizer)
             scaler.update()
 
-            # EMA
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-                    p_ema.data.mul_(0.999).add_(p.data, alpha=1 - 0.999)
+            update_ema(ema_model, model, config.ema_decay)
 
             losses.append(loss.item())
             global_step += 1
 
-        print(f"Epoch {epoch+1} | Loss {np.mean(losses):.6f}")
+        scheduler.step()
+
+        train_loss = np.mean(losses)
+        val_loss = evaluate(ema_model, diffusion, val_loader, device, use_amp)
+
+        print(
+            f"Epoch {epoch+1}/{config.epochs} | "
+            f"train {train_loss:.6f} | val {val_loss:.6f}"
+        )
 
         save_checkpoint(
             args.checkpoint,
@@ -181,12 +237,12 @@ def train(args):
             global_step,
         )
 
-
 # =========================================================
 # CLI
 # =========================================================
 
 def parse_args():
+
     p = argparse.ArgumentParser()
 
     p.add_argument("--clean-path", default="cifar10_grayscale_32x32.npy")
@@ -206,5 +262,6 @@ def parse_args():
 
 
 if __name__ == "__main__":
+
     args = parse_args()
     train(args)
