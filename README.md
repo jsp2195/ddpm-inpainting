@@ -120,7 +120,7 @@ The conditioning pathway encodes spatial structure and injects features at multi
 
 ## Example usage
 
-env -u LD_LIBRARY_PATH python conditional_ddpm_inpainting.py \
+python conditional_ddpm_inpainting.py \
   --train \
   --clean-path cifar10_grayscale_32x32.npy \
   --corrupted-path cifar10_grayscale_32x32_corrupted.npy \
